@@ -35,6 +35,7 @@ class LauncherConfig:
     list_params: DictConfig = DictConfig({})
     grid_params: DictConfig = DictConfig({})
     ablative_params: ListConfig = ListConfig([])
+    paired_range: ListConfig = ListConfig([])
 
 
 ConfigStore.instance().store(group="hydra/sweeper", name="list", node=LauncherConfig)
@@ -50,7 +51,7 @@ def flatten_tuple(original_tuple):
     return new_tuple
 
 class ListSweeper(Sweeper):
-    def __init__(self, list_params: DictConfig, grid_params: DictConfig, ablative_params: ListConfig):
+    def __init__(self, list_params: DictConfig, grid_params: DictConfig, ablative_params: ListConfig, paired_range: ListConfig):
         self.config: Optional[DictConfig] = None
         self.launcher: Optional[Launcher] = None
         self.hydra_context: Optional[HydraContext] = None
@@ -58,6 +59,7 @@ class ListSweeper(Sweeper):
         self.list_params = list_params
         self.grid_params = grid_params
         self.ablative_params = ablative_params
+        self.paired_range = paired_range
 
     def setup(
             self,
@@ -162,6 +164,37 @@ class ListSweeper(Sweeper):
             # overwrite the batch with the ablative batch
             batch = complete_batch
 
+        # Process paired_range params (independent of grid/list/ablative)
+        if len(self.paired_range) > 0:
+            for paired_dict in self.paired_range:
+                # Parse all values in this paired group
+                paired_keys = []
+                paired_values = []
+                
+                for key in paired_dict:
+                    value = paired_dict[key]
+                    parsed_values = self.parse_range(key, value)
+                    paired_keys.append(key)
+                    paired_values.append(parsed_values)
+                
+                # Find the maximum length
+                max_length = max(len(values) for values in paired_values)
+                
+                # Expand single values to match max_length
+                for i in range(len(paired_values)):
+                    if len(paired_values[i]) == 1:
+                        paired_values[i] = paired_values[i] * max_length
+                    elif len(paired_values[i]) != max_length:
+                        raise ValueError(
+                            f"Paired range key {paired_keys[i]} has length {len(paired_values[i])} "
+                            f"but expected either 1 (to be repeated) or {max_length} to match other keys in the same group"
+                        )
+                
+                # Zip the values together and create jobs
+                for idx in range(max_length):
+                    job = tuple(f"{paired_keys[i]}={paired_values[i][idx]}" for i in range(len(paired_keys)))
+                    batch.append(job)
+
         initial_job_idx = 0
         returns = [self.launcher.launch(batch, initial_job_idx)]
         return returns
@@ -184,3 +217,20 @@ class ListSweeper(Sweeper):
         else:
             raise ValueError(f"Cannot parse '{values}' for list key {key}")
         return values
+
+    def parse_range(self, key, value):
+        """Parse range syntax like range(start,stop) or range(start,stop,step)"""
+        if isinstance(value, str) and value.startswith("range(") and value.endswith(")"):
+            # Extract the parameters from range()
+            params_str = value[6:-1]  # Remove 'range(' and ')'
+            params = [int(p.strip()) for p in params_str.split(",")]
+            
+            if len(params) == 2:
+                return list(range(params[0], params[1]))
+            elif len(params) == 3:
+                return list(range(params[0], params[1], params[2]))
+            else:
+                raise ValueError(f"Invalid range syntax for key {key}: {value}")
+        else:
+            # Fall back to regular parse for non-range values
+            return self.parse(key, value)
